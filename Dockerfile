@@ -24,4 +24,6 @@ ENV MAX_CAPACITY=16 \
     INFERENCE_DELAY_MS=0
 
 EXPOSE 8000
+# /docs (Swagger UI) exposes every endpoint, including the camera monitoring
+# ones, with request bodies ready to edit.
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

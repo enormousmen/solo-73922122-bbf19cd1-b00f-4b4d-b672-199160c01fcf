@@ -22,6 +22,14 @@ processing -> failed           (model raised; defensive only)
 Late results are written back ONLY to orders still in `processing` whose
 deadline has not passed, so a late result can never revive a cancelled or
 expired order.
+
+Monitoring hook
+---------------
+`on_completed` is called exactly once for every order that transitions to
+`completed` (never for cancelled, expired or failed orders).  It runs on the
+event-loop thread, so the monitoring registry needs no locks.  Camera
+identity and the reference version in force at acceptance are stored on the
+order; the registry decides whether the completion is still eligible.
 """
 from __future__ import annotations
 
@@ -32,7 +40,7 @@ import uuid
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Callable, Optional
 
 import torch
 
@@ -58,6 +66,11 @@ class Order:
     result: Optional[dict] = None
     batch_id: Optional[str] = None
     created_at: float = field(default_factory=time.monotonic)
+    # Monitoring metadata: None when submitted without camera_id (or when the
+    # camera had no reference at acceptance, in which case the frame is
+    # classified normally but can never enter a monitoring window).
+    camera_id: Optional[str] = None
+    camera_version: Optional[int] = None
 
 
 class BatchEngine:
@@ -68,11 +81,14 @@ class BatchEngine:
         batch_size: int = 4,
         batch_wait_ms: int = 50,
         inference_delay_ms: int = 0,
+        on_completed: Optional[Callable[["Order"], None]] = None,
     ) -> None:
         self.max_capacity = max_capacity
         self.batch_size = batch_size
         self.batch_wait_s = batch_wait_ms / 1000.0
         self.inference_delay_s = inference_delay_ms / 1000.0
+        # Called on the event loop for each order that reaches `completed`.
+        self.on_completed = on_completed
 
         # Single-threaded CPU inference keeps results deterministic and makes
         # the "one batch at a time" guarantee easy to reason about.
@@ -154,8 +170,19 @@ class BatchEngine:
     # ------------------------------------------------------------------ #
     # public API used by the HTTP layer
     # ------------------------------------------------------------------ #
-    def submit(self, tensor: torch.Tensor, deadline_ms: int) -> Optional[Order]:
-        """Accept an image, or return None when at capacity (16 by default)."""
+    def submit(
+        self,
+        tensor: torch.Tensor,
+        deadline_ms: int,
+        camera_id: Optional[str] = None,
+        camera_version: Optional[int] = None,
+    ) -> Optional[Order]:
+        """Accept an image, or return None when at capacity (16 by default).
+
+        `camera_id`/`camera_version` are monitoring metadata only: they are
+        the camera and reference version in force at acceptance.  They do not
+        affect capacity, batching, deadlines or the result.
+        """
         if self.capacity_used() >= self.max_capacity:
             return None
         order = Order(
@@ -163,6 +190,8 @@ class BatchEngine:
             tensor=tensor,
             deadline_ms=deadline_ms,
             deadline_at=time.monotonic() + deadline_ms / 1000.0,
+            camera_id=camera_id,
+            camera_version=camera_version,
         )
         self._orders[order.id] = order
         self._pending.append(order)
@@ -199,6 +228,12 @@ class BatchEngine:
         loop = asyncio.get_running_loop()
         while True:
             await self._not_empty.wait()
+            if not self._pending:
+                # The event can still be set after a batch was drained. With a
+                # zero batch window the inner loop below never clears it, so
+                # clear it here to avoid spinning on an empty queue.
+                self._not_empty.clear()
+                continue
 
             # Batch-formation window: the idle model waits at most
             # `batch_wait_s` for more work, up to `batch_size` images.
@@ -256,6 +291,11 @@ class BatchEngine:
                 o.state = COMPLETED
                 predicted = max(range(len(sc)), key=lambda i: sc[i])
                 o.result = {"predicted_class": predicted, "scores": sc}
+                if self.on_completed is not None:
+                    try:
+                        self.on_completed(o)
+                    except Exception:  # noqa: BLE001 - observability must not break inference
+                        log.exception("completion hook failed for order %s", o.id)
             self._inflight = 0
 
     # ------------------------------------------------------------------ #

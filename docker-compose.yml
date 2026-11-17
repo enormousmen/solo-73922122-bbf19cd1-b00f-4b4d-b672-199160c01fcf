@@ -2,6 +2,7 @@ services:
   classifier:
     build: .
     image: microbatch-classifier:latest
+    container_name: microbatch-classifier
     ports:
       - "8000:8000"
     environment:
@@ -12,4 +13,12 @@ services:
       # Demo knob: simulate slow inference (ms). Submit/query/cancel stay
       # responsive regardless. Set e.g. "2000" to see the effect.
       INFERENCE_DELAY_MS: "0"
+      # Camera monitoring is always on; the window / threshold are fixed by
+      # the spec (last 20 eligible completions, TVD > 0.3 => anomaly).
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).status == 200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
     restart: unless-stopped
